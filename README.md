@@ -5,11 +5,18 @@ It needs only `curl` and `jq`. It does not need Node.js or `wrangler`.
 
 ## Setup
 
-1. Create a Cloudflare API token with the permission **Account > Workers Scripts > Edit**.
-2. Copy the example credentials file and fill in the values:
+1. Create a Cloudflare API token with these permissions:
+
+   | Scope | Resource | Access | Why |
+   | --- | --- | --- | --- |
+   | Account | Workers Scripts | Edit | **Required.** `cwm` uploads, deletes and lists Workers, and reads the `workers.dev` subdomain. |
+   | Account | Account Settings | Read | Optional. Lets tools read account details. `cwm` does not use it now. |
+   | Account | Workers AI | Edit | Optional. For Workers AI. `cwm` does not use it now. |
+
+2. Run the setup script. It asks for the account ID and the token, checks them with the
+   Cloudflare API, and writes `.env/cloudflare-claude-worker-manager.sh` (mode 600):
    ```bash
-   mkdir -p .env
-   cp env.example.sh .env/cloudflare-claude-worker-manager.sh
+   ./setup-env.sh
    ```
 
 ## Usage
@@ -30,6 +37,12 @@ To change a Worker, edit `workers/<name>/index.js` and run `./cwm create <name>`
 | --- | --- | --- |
 | `cwm` | yes | The tool |
 | `templates/worker/index.js` | yes | Starting code for each new Worker |
-| `env.example.sh` | yes | Example credentials file |
+| `setup-env.sh` | yes | Setup script that writes the credentials file |
 | `workers/<name>/` | **no** | Code of each Worker (local data) |
 | `.env/` | **no** | Credentials |
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).
+
+This project is provided as is, without support or maintenance.
