@@ -1,8 +1,12 @@
 # Credentials. Never commit.
 .env/
 
-# Worker data (code of each deployed Worker). Local only.
+# Worker data (one wrangler project per Worker). Local only.
 workers/
+
+# Node.js and wrangler
+node_modules/
+.wrangler/
 
 # OS files
 .DS_Store

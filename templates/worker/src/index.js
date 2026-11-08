@@ -1,5 +1,5 @@
-// Default Worker code. `./cwm create <name>` copies this file to workers/<name>/index.js.
-// workers/ is gitignored. Edit the copy, then run `./cwm create <name>` again to deploy it.
+// Default Worker code. `./cwm create <name>` copies it to workers/<name>/src/index.js.
+// workers/ is gitignored. Edit the copy, then run `./cwm deploy <name>` to deploy it.
 
 export default {
   async fetch(request) {

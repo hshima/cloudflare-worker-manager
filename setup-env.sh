@@ -10,6 +10,7 @@ set -euo pipefail
 #
 # Token permissions (see README.md):
 #   Account > Workers Scripts > Edit     (required by cwm)
+#   Account > Workers KV Storage > Read  (recommended, for `wrangler delete`)
 #   Account > Account Settings > Read    (optional)
 #   Account > Workers AI > Edit          (optional)
 

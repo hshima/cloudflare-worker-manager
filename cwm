@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cwm - Claude Worker Manager.
-# Creates, deletes, recreates and lists Cloudflare Workers through the Cloudflare API.
-# Needs only curl and jq (no Node.js or wrangler).
+# cwm - Cloudflare Worker Manager.
+# Creates, deploys, deletes and recreates Cloudflare Workers with wrangler (installed in
+# node_modules/ by `npm install`). Each Worker is a wrangler project in workers/<name>/.
 #
 # Usage:
-#   ./cwm create   <name>   Deploy workers/<name>/index.js (copied from the template if missing)
-#   ./cwm delete   <name>   Delete the Worker from Cloudflare (local code stays)
-#   ./cwm recreate <name>   Delete, then create again
-#   ./cwm list              List the Workers in the account
-#   ./cwm url      <name>   Print the workers.dev URL
+#   ./cwm create   <name>           Copy the template to workers/<name>/ (if missing), then deploy
+#   ./cwm deploy   <name>           Deploy workers/<name>/ (after you edit the code)
+#   ./cwm delete   <name>           Delete the Worker on Cloudflare (local code stays)
+#   ./cwm recreate <name>           Delete, then deploy again
+#   ./cwm list                      List the Workers in the account
+#   ./cwm url      <name>           Print the workers.dev URL
+#   ./cwm wrangler <name> [args]    Run any wrangler command in workers/<name>/ (dev, tail, ...)
 #
-# Credentials: the script sources .env/cloudflare-claude-worker-manager.sh, which must export
-# CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN. Set CWM_ENV_FILE to use another file.
+# Credentials: the script sources .env/cloudflare-claude-worker-manager.sh (create it with
+# ./setup-env.sh). Set CWM_ENV_FILE to use another file.
 # Worker code lives in workers/ (gitignored). Set CWM_WORKERS_DIR to use another folder.
+# Needs: Node.js 22+, curl and jq.
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly WORKERS_DIR="${CWM_WORKERS_DIR:-$SCRIPT_DIR/workers}"
 readonly TEMPLATE_DIR="$SCRIPT_DIR/templates/worker"
+readonly WRANGLER="$SCRIPT_DIR/node_modules/.bin/wrangler"
 readonly API="https://api.cloudflare.com/client/v4"
-readonly COMPATIBILITY_DATE="2025-09-01"
 
 die() {
   echo "error: $*" >&2
@@ -28,23 +31,25 @@ die() {
 }
 
 usage() {
-  sed -n '4,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '4,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 load_credentials() {
   local env_file="${CWM_ENV_FILE:-$SCRIPT_DIR/.env/cloudflare-claude-worker-manager.sh}"
-  [[ -f "$env_file" ]] || die "credentials file not found: $env_file"
+  [[ -f "$env_file" ]] || die "credentials file not found: $env_file (run ./setup-env.sh)"
   # shellcheck source=/dev/null
   source "$env_file"
   [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || die "CLOUDFLARE_ACCOUNT_ID is not set"
   [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || die "CLOUDFLARE_API_TOKEN is not set"
+  export CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN
 }
 
 check_dependencies() {
   local tool
-  for tool in curl jq; do
-    command -v "$tool" >/dev/null || die "$tool is not installed"
+  for tool in curl jq node; do
+    command -v "$tool" >/dev/null || die "$tool is not installed or not in PATH"
   done
+  [[ -x "$WRANGLER" ]] || die "wrangler is not installed. Run: npm install"
 }
 
 validate_name() {
@@ -53,14 +58,21 @@ validate_name() {
     die "invalid name '$name': use 1-63 lowercase letters, digits or dashes"
 }
 
-# api METHOD PATH [curl args...] -> prints the JSON response; exits if success is false.
+worker_dir() {
+  echo "$WORKERS_DIR/$1"
+}
+
+require_worker_dir() {
+  [[ -f "$(worker_dir "$1")/wrangler.jsonc" ]] ||
+    die "workers/$1/wrangler.jsonc not found. Run: ./cwm create $1"
+}
+
+# api METHOD PATH -> prints the JSON response; fails if success is false.
 api() {
-  local method="$1" path="$2"
-  shift 2
-  local response
+  local method="$1" path="$2" response
   response="$(curl -sS -X "$method" \
     -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-    "$@" "$API/accounts/$CLOUDFLARE_ACCOUNT_ID$path")" || die "request failed: $method $path"
+    "$API/accounts/$CLOUDFLARE_ACCOUNT_ID$path")" || die "request failed: $method $path"
   if [[ "$(jq -r '.success' <<<"$response")" != "true" ]]; then
     echo "Cloudflare API error ($method $path):" >&2
     jq -r '.errors[] | "  [\(.code)] \(.message)"' <<<"$response" >&2
@@ -70,52 +82,38 @@ api() {
 }
 
 worker_exists() {
-  local name="$1"
-  api GET "/workers/scripts" | jq -e --arg n "$name" '.result[] | select(.id == $n)' >/dev/null
-}
-
-account_subdomain() {
-  api GET "/workers/subdomain" | jq -r '.result.subdomain'
+  api GET "/workers/scripts" | jq -e --arg n "$1" '.result[] | select(.id == $n)' >/dev/null
 }
 
 worker_url() {
-  echo "https://$1.$(account_subdomain).workers.dev"
+  echo "https://$1.$(api GET "/workers/subdomain" | jq -r '.result.subdomain').workers.dev"
+}
+
+# run_wrangler NAME [args...] -> runs wrangler inside workers/<name>/.
+run_wrangler() {
+  local name="$1"
+  shift
+  (cd "$(worker_dir "$name")" && "$WRANGLER" "$@")
 }
 
 scaffold_if_missing() {
-  local name="$1"
-  if [[ ! -f "$WORKERS_DIR/$name/index.js" ]]; then
-    mkdir -p "$WORKERS_DIR/$name"
-    cp "$TEMPLATE_DIR/index.js" "$WORKERS_DIR/$name/index.js"
-    echo "Created $WORKERS_DIR/$name/index.js from the template."
-  fi
-}
-
-upload_worker() {
-  local name="$1"
-  local metadata
-  metadata="$(jq -nc --arg d "$COMPATIBILITY_DATE" \
-    '{main_module: "index.js", compatibility_date: $d}')"
-  api PUT "/workers/scripts/$name" \
-    -F "metadata=$metadata;type=application/json" \
-    -F "index.js=@$WORKERS_DIR/$name/index.js;type=application/javascript+module" >/dev/null
-}
-
-enable_workers_dev() {
-  local name="$1"
-  api POST "/workers/scripts/$name/subdomain" \
-    -H "Content-Type: application/json" \
-    --data '{"enabled": true, "previews_enabled": false}' >/dev/null
+  local name="$1" dir
+  dir="$(worker_dir "$name")"
+  [[ -e "$dir" ]] && return 0
+  mkdir -p "$WORKERS_DIR"
+  cp -R "$TEMPLATE_DIR" "$dir"
+  sed -i.bak "s/__WORKER_NAME__/$name/" "$dir/wrangler.jsonc" && rm "$dir/wrangler.jsonc.bak"
+  echo "Created workers/$name/ from the template."
 }
 
 cmd_create() {
-  local name="$1"
-  scaffold_if_missing "$name"
-  echo "Uploading Worker '$name'..."
-  upload_worker "$name"
-  enable_workers_dev "$name"
-  echo "Done: $(worker_url "$name")"
-  echo "(A new workers.dev URL can take up to a minute to answer.)"
+  scaffold_if_missing "$1"
+  cmd_deploy "$1"
+}
+
+cmd_deploy() {
+  require_worker_dir "$1"
+  run_wrangler "$1" deploy
 }
 
 cmd_delete() {
@@ -125,13 +123,27 @@ cmd_delete() {
     return 0
   fi
   echo "Deleting Worker '$name'..."
-  api DELETE "/workers/scripts/$name?force=true" >/dev/null
-  echo "Deleted. Local code stays in $WORKERS_DIR/$name/."
+  # CI=true and closed stdin: wrangler skips its "Are you sure?" question, also in a
+  # real terminal. Running from SCRIPT_DIR means the delete does not need the local folder.
+  local output
+  if output="$(cd "$SCRIPT_DIR" && CI=true "$WRANGLER" delete "$name" </dev/null 2>&1)"; then
+    echo "Deleted."
+  elif worker_exists "$name"; then
+    printf '%s\n' "$output" >&2
+    die "wrangler could not delete '$name'"
+  else
+    # After the delete, wrangler lists KV namespaces to clean up old Workers Sites
+    # assets. Without a KV permission that step fails, but the Worker is gone.
+    echo "Deleted. (wrangler's KV cleanup step failed because the token has no"
+    echo "'Workers KV Storage: Read' permission. You can ignore this.)"
+  fi
+  echo "Local code stays in workers/$name/."
 }
 
 cmd_recreate() {
+  require_worker_dir "$1"
   cmd_delete "$1"
-  cmd_create "$1"
+  cmd_deploy "$1"
 }
 
 cmd_list() {
@@ -162,14 +174,20 @@ main() {
     list)
       cmd_list
       ;;
-    create | delete | recreate | url)
+    create | deploy | delete | recreate | url | wrangler)
       [[ -n "$name" ]] || die "missing <name>. Run: ./cwm help"
       validate_name "$name"
       case "$command" in
         create) cmd_create "$name" ;;
+        deploy) cmd_deploy "$name" ;;
         delete) cmd_delete "$name" ;;
         recreate) cmd_recreate "$name" ;;
         url) worker_url "$name" ;;
+        wrangler)
+          require_worker_dir "$name"
+          shift 2
+          run_wrangler "$name" "$@"
+          ;;
       esac
       ;;
     *)

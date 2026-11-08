@@ -1,0 +1,14 @@
+// Wrangler configuration for one Worker. `./cwm create <name>` copies this folder to
+// workers/<name>/ and replaces __WORKER_NAME__. Reference:
+// https://developers.cloudflare.com/workers/wrangler/configuration/
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "__WORKER_NAME__",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true
+  }
+}

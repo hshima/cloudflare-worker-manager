@@ -1,0 +1,12 @@
+{
+  "name": "cloudflare-worker-manager",
+  "private": true,
+  "description": "Create, delete and recreate Cloudflare Workers with wrangler",
+  "license": "BSD-3-Clause",
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "wrangler": "4.158.0"
+  }
+}
