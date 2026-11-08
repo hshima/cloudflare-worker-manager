@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cwm - Claude Worker Manager.
+# Creates, deletes, recreates and lists Cloudflare Workers through the Cloudflare API.
+# Needs only curl and jq (no Node.js or wrangler).
+#
+# Usage:
+#   ./cwm create   <name>   Deploy workers/<name>/index.js (copied from the template if missing)
+#   ./cwm delete   <name>   Delete the Worker from Cloudflare (local code stays)
+#   ./cwm recreate <name>   Delete, then create again
+#   ./cwm list              List the Workers in the account
+#   ./cwm url      <name>   Print the workers.dev URL
+#
+# Credentials: the script sources .env/cloudflare-claude-worker-manager.sh, which must export
+# CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN. Set CWM_ENV_FILE to use another file.
+# Worker code lives in workers/ (gitignored). Set CWM_WORKERS_DIR to use another folder.
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly WORKERS_DIR="${CWM_WORKERS_DIR:-$SCRIPT_DIR/workers}"
+readonly TEMPLATE_DIR="$SCRIPT_DIR/templates/worker"
+readonly API="https://api.cloudflare.com/client/v4"
+readonly COMPATIBILITY_DATE="2025-09-01"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '4,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+load_credentials() {
+  local env_file="${CWM_ENV_FILE:-$SCRIPT_DIR/.env/cloudflare-claude-worker-manager.sh}"
+  [[ -f "$env_file" ]] || die "credentials file not found: $env_file"
+  # shellcheck source=/dev/null
+  source "$env_file"
+  [[ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]] || die "CLOUDFLARE_ACCOUNT_ID is not set"
+  [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || die "CLOUDFLARE_API_TOKEN is not set"
+}
+
+check_dependencies() {
+  local tool
+  for tool in curl jq; do
+    command -v "$tool" >/dev/null || die "$tool is not installed"
+  done
+}
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] ||
+    die "invalid name '$name': use 1-63 lowercase letters, digits or dashes"
+}
+
+# api METHOD PATH [curl args...] -> prints the JSON response; exits if success is false.
+api() {
+  local method="$1" path="$2"
+  shift 2
+  local response
+  response="$(curl -sS -X "$method" \
+    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+    "$@" "$API/accounts/$CLOUDFLARE_ACCOUNT_ID$path")" || die "request failed: $method $path"
+  if [[ "$(jq -r '.success' <<<"$response")" != "true" ]]; then
+    echo "Cloudflare API error ($method $path):" >&2
+    jq -r '.errors[] | "  [\(.code)] \(.message)"' <<<"$response" >&2
+    return 1
+  fi
+  printf '%s\n' "$response"
+}
+
+worker_exists() {
+  local name="$1"
+  api GET "/workers/scripts" | jq -e --arg n "$name" '.result[] | select(.id == $n)' >/dev/null
+}
+
+account_subdomain() {
+  api GET "/workers/subdomain" | jq -r '.result.subdomain'
+}
+
+worker_url() {
+  echo "https://$1.$(account_subdomain).workers.dev"
+}
+
+scaffold_if_missing() {
+  local name="$1"
+  if [[ ! -f "$WORKERS_DIR/$name/index.js" ]]; then
+    mkdir -p "$WORKERS_DIR/$name"
+    cp "$TEMPLATE_DIR/index.js" "$WORKERS_DIR/$name/index.js"
+    echo "Created $WORKERS_DIR/$name/index.js from the template."
+  fi
+}
+
+upload_worker() {
+  local name="$1"
+  local metadata
+  metadata="$(jq -nc --arg d "$COMPATIBILITY_DATE" \
+    '{main_module: "index.js", compatibility_date: $d}')"
+  api PUT "/workers/scripts/$name" \
+    -F "metadata=$metadata;type=application/json" \
+    -F "index.js=@$WORKERS_DIR/$name/index.js;type=application/javascript+module" >/dev/null
+}
+
+enable_workers_dev() {
+  local name="$1"
+  api POST "/workers/scripts/$name/subdomain" \
+    -H "Content-Type: application/json" \
+    --data '{"enabled": true, "previews_enabled": false}' >/dev/null
+}
+
+cmd_create() {
+  local name="$1"
+  scaffold_if_missing "$name"
+  echo "Uploading Worker '$name'..."
+  upload_worker "$name"
+  enable_workers_dev "$name"
+  echo "Done: $(worker_url "$name")"
+  echo "(A new workers.dev URL can take up to a minute to answer.)"
+}
+
+cmd_delete() {
+  local name="$1"
+  if ! worker_exists "$name"; then
+    echo "Worker '$name' does not exist on Cloudflare. Nothing to delete."
+    return 0
+  fi
+  echo "Deleting Worker '$name'..."
+  api DELETE "/workers/scripts/$name?force=true" >/dev/null
+  echo "Deleted. Local code stays in $WORKERS_DIR/$name/."
+}
+
+cmd_recreate() {
+  cmd_delete "$1"
+  cmd_create "$1"
+}
+
+cmd_list() {
+  local response
+  response="$(api GET "/workers/scripts")"
+  if [[ "$(jq '.result | length' <<<"$response")" -eq 0 ]]; then
+    echo "No Workers in this account."
+    return 0
+  fi
+  jq -r '.result[] | "\(.id)\t(modified \(.modified_on))"' <<<"$response"
+}
+
+main() {
+  local command="${1:-help}"
+  local name="${2:-}"
+
+  case "$command" in
+    help | -h | --help)
+      usage
+      return 0
+      ;;
+  esac
+
+  check_dependencies
+  load_credentials
+
+  case "$command" in
+    list)
+      cmd_list
+      ;;
+    create | delete | recreate | url)
+      [[ -n "$name" ]] || die "missing <name>. Run: ./cwm help"
+      validate_name "$name"
+      case "$command" in
+        create) cmd_create "$name" ;;
+        delete) cmd_delete "$name" ;;
+        recreate) cmd_recreate "$name" ;;
+        url) worker_url "$name" ;;
+      esac
+      ;;
+    *)
+      die "unknown command '$command'. Run: ./cwm help"
+      ;;
+  esac
+}
+
+main "$@"

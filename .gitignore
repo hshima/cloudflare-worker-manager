@@ -1,0 +1,8 @@
+# Credentials. Never commit.
+.env/
+
+# Worker data (code of each deployed Worker). Local only.
+workers/
+
+# OS files
+.DS_Store
